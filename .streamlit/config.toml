@@ -1,0 +1,6 @@
+[server]
+maxUploadSize = 1000
+
+[theme]
+base = "dark"
+backgroundColor = "#1e1e1e"

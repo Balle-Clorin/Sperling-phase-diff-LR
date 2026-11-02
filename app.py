@@ -54,9 +54,11 @@ RECORD_PROFILES = {
             "45": {"rpm": 45.0,        "duration_s": 16 * 60 + 5,  "r_start_mm": 146.05, "r_end_mm": 57.5},
         },
         "markers_mm": (120.9, 66.0),
+        "tone_hz": 1000.0,
     },
     "clearaudio": {
         "label": "clearaudio",
+        "tone_hz": 3150.0,
         "sides": {
             "33": {"rpm": 100.0 / 3.0, "duration_s": 14 * 60 + 58, "r_start_mm": 127, "r_end_mm": 69.0},
         },
@@ -135,6 +137,14 @@ def run_analysis(path, display_name, C, progress=None):
         log.append((level, txt))
 
     MODE = C["MODE"]
+    # tone frequency: explicit override > record profile > default
+    _prof_hz = RECORD_PROFILES[C["RECORD_PROFILE"]].get("tone_hz") if C["RECORD_PROFILE"] else None
+    if C["FREQ_CENTER"] and C["FREQ_CENTER"] > 0:
+        C = dict(C, FREQ_CENTER=float(C["FREQ_CENTER"]))
+        _hz_src = "manual"
+    else:
+        C = dict(C, FREQ_CENTER=float(_prof_hz or DEFAULTS["FREQ_CENTER"]))
+        _hz_src = "record profile" if _prof_hz else "default"
     NFFT, HOP = int(C["NFFT"]), int(C["HOP"])
     SMOOTH_MS = C["SMOOTH_MS"]
     PHASE_UNIT = C["PHASE_UNIT"]
@@ -148,6 +158,8 @@ def run_analysis(path, display_name, C, progress=None):
     n_channels = sf_file.channels
     total_frames = len(sf_file)
     say(f"Opened: {display_name}  sr={sr} channels={n_channels} frames={total_frames} subtype={sf_desc.subtype}")
+    if MODE == "peak":
+        say(f"Peak mode: tracking tone at {C['FREQ_CENTER']:.0f} Hz ± {C['FREQ_TOL_HZ']:.0f} Hz ({_hz_src})")
 
     if HOP >= NFFT:
         raise ValueError("HOP must be smaller than NFFT.")
@@ -903,7 +915,6 @@ with st.sidebar:
             MODE = st.selectbox("Mode", ["peak", "sweep", "broadband"], index=0,
                                 help="peak: track the tone near a set frequency. sweep: track the dominant bin in a band. "
                                      "broadband: magnitude-weighted phase over a band.")
-            FREQ_CENTER = st.number_input("Tone frequency (Hz), peak mode", value=D["FREQ_CENTER"], step=10.0)
             FREQ_TOL_HZ = st.number_input("Search window ± (Hz), peak mode", value=D["FREQ_TOL_HZ"], step=1.0)
             c1, c2 = st.columns(2)
             sw_lo = c1.number_input("Sweep band low (Hz)", value=D["SWEEP_BAND"][0])
@@ -924,6 +935,9 @@ with st.sidebar:
         with st.expander("Record profile", expanded=True):
             prof_choice = st.selectbox("Record", ["sperling", "clearaudio", "none (time axis)"], index=0)
             RECORD_PROFILE = None if prof_choice.startswith("none") else prof_choice
+            FREQ_CENTER = st.number_input("Tone frequency (Hz), peak mode", value=0.0, min_value=0.0, step=10.0,
+                                          help="0 = use the record's tone (Sperling 1000 Hz, clearaudio 3150 Hz). "
+                                               "Enter a value to override, e.g. for a record in time mode.")
             side_opts = ["auto"] + (list(RECORD_PROFILES[RECORD_PROFILE]["sides"]) if RECORD_PROFILE else [])
             RECORD_SIDE = st.selectbox("Record side (rpm)", side_opts, index=0,
                                        help="auto picks the side whose band length matches the detected tone. "

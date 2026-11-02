@@ -903,9 +903,9 @@ D = DEFAULTS
 def opt_float(label, default, key, help=None):
     """Number input with an 'auto' checkbox meaning None."""
     use = st.checkbox(f"{label}: set manually", value=default is not None, key=key + "_on", help=help)
-    if use:
-        return st.number_input(label, value=float(default if default is not None else 0.0), key=key, format="%.3f")
-    return None
+    # Always render the number box: inside a form, a checkbox cannot show/hide widgets before Run.
+    val = st.number_input(label, value=float(default if default is not None else 0.0), key=key, format="%.3f")
+    return val if use else None
 
 
 with st.sidebar:

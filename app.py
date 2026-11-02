@@ -910,6 +910,15 @@ def opt_float(label, default, key, help=None):
 
 with st.sidebar:
     st.header("Settings")
+    # Record and tone frequency sit OUTSIDE the form so they update immediately when the record is
+    # changed: the frequency box then shows the record's real tone (Sperling 1000 Hz, clearaudio 3150 Hz)
+    # and the record-side list refreshes without pressing Run.
+    prof_choice = st.selectbox("Record", ["sperling", "clearaudio", "none (time axis)"], index=0, key="prof_choice")
+    RECORD_PROFILE = None if prof_choice.startswith("none") else prof_choice
+    _hz_default = (RECORD_PROFILES[RECORD_PROFILE].get("tone_hz") if RECORD_PROFILE else None) or D["FREQ_CENTER"]
+    FREQ_CENTER = st.number_input("Tone frequency (Hz), peak mode", value=float(_hz_default), min_value=1.0,
+                                  step=10.0, key=f"tone_hz_{prof_choice}",
+                                  help="Defaults to the selected record's tone. Edit it to track a different frequency.")
     with st.form("settings"):
         with st.expander("Analysis", expanded=True):
             MODE = st.selectbox("Mode", ["peak", "sweep", "broadband"], index=0,
@@ -933,15 +942,9 @@ with st.sidebar:
             y_hi = c2.number_input("Phase y max", value=3.0)
 
         with st.expander("Record profile", expanded=True):
-            prof_choice = st.selectbox("Record", ["sperling", "clearaudio", "none (time axis)"], index=0)
-            RECORD_PROFILE = None if prof_choice.startswith("none") else prof_choice
-            FREQ_CENTER = st.number_input("Tone frequency (Hz), peak mode", value=0.0, min_value=0.0, step=10.0,
-                                          help="0 = use the record's tone (Sperling 1000 Hz, clearaudio 3150 Hz). "
-                                               "Enter a value to override, e.g. for a record in time mode.")
             side_opts = ["auto"] + (list(RECORD_PROFILES[RECORD_PROFILE]["sides"]) if RECORD_PROFILE else [])
-            RECORD_SIDE = st.selectbox("Record side (rpm)", side_opts, index=0,
-                                       help="auto picks the side whose band length matches the detected tone. "
-                                            "Change the record and press Run once to refresh this list.")
+            RECORD_SIDE = st.selectbox("Record side (rpm)", side_opts, index=0, key=f"side_{prof_choice}",
+                                       help="auto picks the side whose band length matches the detected tone.")
             RADIUS_ALIGN = st.selectbox("Radius alignment", ["both", "onset", "manual"], index=0,
                                         help="both: detect tone start and end and stretch to fit (absorbs speed error). "
                                              "onset: detect start, use nominal duration. manual: start at the offset below.")

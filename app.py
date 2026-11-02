@@ -880,7 +880,7 @@ def fig_to_png(fig):
 # Streamlit UI
 # ---------------------------
 st.set_page_config(page_title="Sperling Phase Analyser", layout="wide")
-st.title("R-L phase, delay and 2nd harmonic vs groove radius")
+st.title("EXPERIMENTAL, may fail!! R-L phase, delay and 2nd harmonic vs groove radius")
 st.caption("Upload a stereo needle-drop of a single-tone test record (Sperling, Clearaudio, or any record in time mode). "
            "The app tracks the R-L phase difference, delay, level and 2nd harmonic, maps time to groove radius, "
            "and fits a tracking-error curve to check your tonearm alignment.")

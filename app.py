@@ -920,6 +920,8 @@ with st.sidebar:
                                   step=10.0, key=f"tone_hz_{prof_choice}",
                                   help="Defaults to the selected record's tone. Edit it to track a different frequency.")
     with st.form("settings"):
+        # Submit button first, so it sits at the top of the form (it still submits every widget below it).
+        submitted = st.form_submit_button("Run analysis", type="primary", width="stretch")
         with st.expander("Analysis", expanded=True):
             MODE = st.selectbox("Mode", ["peak", "sweep", "broadband"], index=0,
                                 help="peak: track the tone near a set frequency. sweep: track the dominant bin in a band. "
@@ -986,7 +988,6 @@ with st.sidebar:
                                                 help="Unchecked = the record band's outer radius.")
 
         SHOW_PAGE2 = st.checkbox("Show page 2 (phase + H2 + fit table)", value=D["SHOW_PAGE2"])
-        submitted = st.form_submit_button("Run analysis", type="primary", width="stretch")
 
 cfg = dict(
     MODE=MODE, FREQ_CENTER=FREQ_CENTER, FREQ_TOL_HZ=FREQ_TOL_HZ,

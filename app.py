@@ -78,7 +78,7 @@ DEFAULTS = dict(
     SHOW_PAGE2=True,
     PHASE_FIT_TRACKING_ERROR=True, PHASE_FIT_MODEL="geometry",
     PHASE_FIT_N1_GUESS_MM=66.0, PHASE_FIT_N2_GUESS_MM=121.0,
-    PHASE_FIT_PIVOT_SPINDLE_MM=215.35, PHASE_FIT_OVERHANG_GUESS_MM=17.8,
+    PHASE_FIT_PIVOT_SPINDLE_MM=215.35, PHASE_FIT_EFF_LENGTH_MM=233.0, PHASE_FIT_OVERHANG_GUESS_MM=17.8,
     PHASE_FIT_OFFSET_ANGLE_GUESS_DEG=23.6, PHASE_FIT_TRIM_S=10.0,
     PHASE_FIT_SHOW_OPTIMAL=True, PHASE_FIT_LOFGREN_R1_MM=60.3, PHASE_FIT_LOFGREN_R2_MM=146.05,
     PHASE_FIT_OFFSET_DEG=0.0,
@@ -429,6 +429,8 @@ def run_analysis(path, display_name, C, progress=None):
             say("Tracking-error fit needs an active record profile (radius axis). Fit not applied.", "warn")
         elif PHASE_FIT_MODEL == "geometry" and not C["PHASE_FIT_PIVOT_SPINDLE_MM"]:
             say("Geometry fit needs the pivot-to-spindle distance. Fit not applied.", "warn")
+        elif PHASE_FIT_MODEL == "geometry_L" and not C["PHASE_FIT_EFF_LENGTH_MM"]:
+            say("Fixed-length geometry fit needs the effective length. Fit not applied.", "warn")
         else:
             TRIM = C["PHASE_FIT_TRIM_S"]
             _fit_mask = (times >= TRIM) & (times <= times[-1] - TRIM) & np.isfinite(radius_mm)
@@ -440,11 +442,20 @@ def run_analysis(path, display_name, C, progress=None):
                 _r_lo, _r_hi = min(sp_r0, sp_r1), max(sp_r0, sp_r1)
                 _c_fixed = C["PHASE_FIT_OFFSET_DEG"]
                 _unit = "deg" if PHASE_UNIT == "degrees" else "rad"
-                _D = float(C["PHASE_FIT_PIVOT_SPINDLE_MM"] or 0.0)
+                # geometry: pivot-to-spindle D is fixed, effective length L = D + overhang is fitted.
+                # geometry_L: effective length L is fixed (e.g. SME), D = L - overhang is fitted
+                # (the arm base is adjustable). In both cases the free parameter is the overhang.
+                _fixL = (PHASE_FIT_MODEL == "geometry_L")
+                _D0 = float(C["PHASE_FIT_PIVOT_SPINDLE_MM"] or 0.0)
+                _L0 = float(C["PHASE_FIT_EFF_LENGTH_MM"] or 0.0)
 
-                def _E_deg(r, L, alpha_deg):
+                def _LD(oh):
+                    """(effective length, pivot-to-spindle) for a given overhang."""
+                    return (_L0, _L0 - oh) if _fixL else (_D0 + oh, _D0)
+
+                def _E_deg(r, L, D, alpha_deg):
                     alpha = np.radians(alpha_deg)
-                    cosd = np.clip((L**2 + r**2 - _D**2) / (2.0 * L * r), -1.0, 1.0)
+                    cosd = np.clip((L**2 + r**2 - D**2) / (2.0 * L * r), -1.0, 1.0)
                     return np.degrees(np.pi / 2.0 - alpha - np.arccos(cosd))
 
                 if PHASE_FIT_MODEL == "shape":
@@ -468,13 +479,13 @@ def run_analysis(path, display_name, C, progress=None):
                     if _c_fixed is None:
                         def _resid(params, r, y):
                             c, k, oh, alpha = params
-                            return c + k * _E_deg(r, _D + oh, alpha) - y
+                            return c + k * _E_deg(r, *_LD(oh), alpha) - y
                         _p0 = [float(np.mean(_pf)), 0.03, C["PHASE_FIT_OVERHANG_GUESS_MM"], C["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"]]
                         _bounds = ([-np.inf, -np.inf, _oh_lo, _al_lo], [np.inf, np.inf, _oh_hi, _al_hi])
                     else:
                         def _resid(params, r, y):
                             k, oh, alpha = params
-                            return _c_fixed + k * _E_deg(r, _D + oh, alpha) - y
+                            return _c_fixed + k * _E_deg(r, *_LD(oh), alpha) - y
                         _p0 = [0.03, C["PHASE_FIT_OVERHANG_GUESS_MM"], C["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"]]
                         _bounds = ([-np.inf, _oh_lo, _al_lo], [np.inf, _oh_hi, _al_hi])
                 try:
@@ -514,28 +525,39 @@ def run_analysis(path, display_name, C, progress=None):
                         else:
                             k_fit, oh_fit, alpha_fit = _res.x
                             c_fit = _c_fixed
-                        L_fit = _D + oh_fit
-                        phase_fit_curve = c_fit + k_fit * _E_deg(radius_mm, L_fit, alpha_fit)
+                        L_fit, D_fit = _LD(oh_fit)
+                        phase_fit_curve = c_fit + k_fit * _E_deg(radius_mm, L_fit, D_fit, alpha_fit)
                         phase_fit_active = True
+                        if _fixL:
+                            _mname = "geometry, fixed length"
+                            _given_txt = (f"effective length {L_fit:.2f} mm (given), pivot-spindle {D_fit:.2f} mm "
+                                          f"(fitted, overhang {oh_fit:+.2f} mm)")
+                            _geo_rows = [("Effective length (mm)", f"{L_fit:.2f} (given)"),
+                                         ("Pivot-spindle (mm)", f"{D_fit:.2f}"),
+                                         ("Overhang (mm)", f"{oh_fit:+.2f}")]
+                        else:
+                            _mname = "geometry"
+                            _given_txt = (f"pivot-spindle {D_fit:.1f} mm (given), overhang {oh_fit:+.2f} mm "
+                                          f"(Leff {L_fit:.2f} mm)")
+                            _geo_rows = [("Pivot-spindle (mm)", f"{D_fit:.1f} (given)"),
+                                         ("Overhang (mm)", f"{oh_fit:+.2f}"),
+                                         ("Leff (mm)", f"{L_fit:.2f}")]
                         if _c_fixed is None:
-                            phase_fit_note = (f"Tracking-error fit (geometry): pivot-spindle {_D:.1f} mm (given), "
-                                              f"overhang {oh_fit:+.2f} mm (Leff {L_fit:.2f} mm), R²={r2_fit:.2f}")
+                            # Offset angle is exactly degenerate with the free constant c (alpha only enters E(r)
+                            # as an additive constant), so nulls are not determined by the curve shape.
+                            phase_fit_note = f"Tracking-error fit ({_mname}): {_given_txt}, R²={r2_fit:.2f}"
                             say(phase_fit_note)
-                            phase_fit_table = [
-                                ("Model", "geometry", None),
-                                ("Pivot-spindle (mm)", f"{_D:.1f} (given)", None),
-                                ("Overhang (mm)", f"{oh_fit:+.2f}", None),
-                                ("Leff (mm)", f"{L_fit:.2f}", None),
-                                ("Offset angle", "indeterminate", None),
-                                ("Nulls (mm)", "indeterminate", None),
-                                ("R²", f"{r2_fit:.2f}", None),
-                            ]
+                            phase_fit_table = ([("Model", _mname, None)]
+                                               + [(lbl, fv, None) for lbl, fv in _geo_rows]
+                                               + [("Offset angle", "indeterminate", None),
+                                                  ("Nulls (mm)", "indeterminate", None),
+                                                  ("R²", f"{r2_fit:.2f}", None)])
                             say("With a free phase offset, offset angle and the constant offset are fully "
                                 "degenerate: every offset angle can be matched by some offset to give an "
                                 "identical curve. Null positions are therefore not shown. Set a known constant "
                                 "phase offset to make offset angle and nulls identifiable.", "warn")
                         else:
-                            _disc = _D**2 - (L_fit * np.cos(np.radians(alpha_fit)))**2
+                            _disc = D_fit**2 - (L_fit * np.cos(np.radians(alpha_fit)))**2
                             if _disc >= 0:
                                 _s = np.sqrt(_disc)
                                 n1_fit = L_fit * np.sin(np.radians(alpha_fit)) - _s
@@ -544,21 +566,21 @@ def run_analysis(path, display_name, C, progress=None):
                                 _null_txt = f"nulls {n1_fit:.1f} & {n2_fit:.1f} mm, "
                             else:
                                 _null_txt = "no real null radii for this fitted geometry, "
-                            phase_fit_note = (f"Tracking-error fit (geometry): pivot-spindle {_D:.1f} mm (given), "
-                                              f"overhang {oh_fit:+.2f} mm (Leff {L_fit:.2f} mm), "
+                            phase_fit_note = (f"Tracking-error fit ({_mname}): {_given_txt}, "
                                               f"offset angle {alpha_fit:.2f} deg, " + _null_txt +
                                               f"offset {c_fit:+.3f} {_unit} (fixed), R²={r2_fit:.2f}")
                             say(phase_fit_note)
                             _fitted_null_str = (f"{n1_fit:.1f} & {n2_fit:.1f}" if _disc >= 0 else "none (complex)")
-                            phase_fit_table = [
-                                ("Pivot-spindle (mm)", f"{_D:.1f} (given)", None),
-                                ("Overhang (mm)", f"{oh_fit:+.2f}", None),
-                                ("Leff (mm)", f"{L_fit:.2f}", None),
-                                ("Offset angle (deg)", f"{alpha_fit:.2f}", None),
-                                ("Nulls (mm)", _fitted_null_str, None),
-                                (f"Offset ({_unit})", f"{c_fit:+.3f} (fixed)", None),
-                                ("R²", f"{r2_fit:.2f}", None),
-                            ]
+                            phase_fit_table = ([(lbl, fv, None) for lbl, fv in _geo_rows]
+                                               + [("Offset angle (deg)", f"{alpha_fit:.2f}", None),
+                                                  ("Nulls (mm)", _fitted_null_str, None),
+                                                  (f"Offset ({_unit})", f"{c_fit:+.3f} (fixed)", None),
+                                                  ("R²", f"{r2_fit:.2f}", None)])
+
+                            # Optimal (Loefgren A) comparison curve for the chosen groove range, same k and c.
+                            # Nulls n = L sin(a) +/- sqrt(D^2 - (L cos a)^2) must equal the targets t1, t2:
+                            #   L sin(a) = (t1+t2)/2   and   D^2 - (L cos a)^2 = ((t2-t1)/2)^2.
+                            # geometry: D fixed -> solve L and a.  geometry_L: L fixed -> solve a and D.
                             if C["PHASE_FIT_SHOW_OPTIMAL"]:
                                 _lg_r1 = float(C["PHASE_FIT_LOFGREN_R1_MM"]) if C["PHASE_FIT_LOFGREN_R1_MM"] else min(sp_r0, sp_r1)
                                 _lg_r2 = float(C["PHASE_FIT_LOFGREN_R2_MM"]) if C["PHASE_FIT_LOFGREN_R2_MM"] else max(sp_r0, sp_r1)
@@ -566,30 +588,55 @@ def run_analysis(path, display_name, C, progress=None):
                                 _t1 = 2.0 / ((1 + _lg_s) / _lg_r1 + (1 - _lg_s) / _lg_r2)
                                 _t2 = 2.0 / ((1 - _lg_s) / _lg_r1 + (1 + _lg_s) / _lg_r2)
                                 _half_sep = (_t2 - _t1) / 2.0
-                                _Lcos_sq = _D**2 - _half_sep**2
-                                if _Lcos_sq >= 0:
-                                    _Lcos = np.sqrt(_Lcos_sq)
-                                    _Lsin = (_t1 + _t2) / 2.0
-                                    L_opt = float(np.hypot(_Lsin, _Lcos))
-                                    alpha_opt = float(np.degrees(np.arctan2(_Lsin, _Lcos)))
-                                    oh_opt = L_opt - _D
-                                    phase_opt_curve = c_fit + k_fit * _E_deg(radius_mm, L_opt, alpha_opt)
+                                _Lsin = (_t1 + _t2) / 2.0
+                                _opt_ok = False
+                                if _fixL:
+                                    if _Lsin <= _L0:
+                                        L_opt = _L0
+                                        alpha_opt = float(np.degrees(np.arcsin(_Lsin / _L0)))
+                                        D_opt = float(np.sqrt(_half_sep**2 + (_L0 * np.cos(np.radians(alpha_opt)))**2))
+                                        _opt_ok = True
+                                else:
+                                    _Lcos_sq = _D0**2 - _half_sep**2
+                                    if _Lcos_sq >= 0:
+                                        L_opt = float(np.hypot(_Lsin, np.sqrt(_Lcos_sq)))
+                                        alpha_opt = float(np.degrees(np.arctan2(_Lsin, np.sqrt(_Lcos_sq))))
+                                        D_opt = _D0
+                                        _opt_ok = True
+                                if _opt_ok:
+                                    oh_opt = L_opt - D_opt
+                                    phase_opt_curve = c_fit + k_fit * _E_deg(radius_mm, L_opt, D_opt, alpha_opt)
                                     phase_opt_nulls = (_t1, _t2)
-                                    say(f"Optimal alignment (Löfgren A for {_lg_r1:.2f}-{_lg_r2:.2f} mm groove "
-                                        f"range -> nulls {_t1:.1f} & {_t2:.1f} mm) at pivot-spindle {_D:.1f} mm: "
-                                        f"overhang {oh_opt:+.2f} mm (Leff {L_opt:.2f} mm), offset angle {alpha_opt:.2f} deg "
-                                        f"(fitted: overhang {oh_fit:+.2f} mm, offset angle {alpha_fit:.2f} deg)")
-                                    _col = {"Pivot-spindle (mm)": f"{_D:.1f} (given)",
-                                            "Overhang (mm)": f"{oh_opt:+.2f}",
-                                            "Leff (mm)": f"{L_opt:.2f}",
+                                    _rng = (f"Löfgren A for {_lg_r1:.2f}-{_lg_r2:.2f} mm groove range "
+                                            f"-> nulls {_t1:.1f} & {_t2:.1f} mm")
+                                    if _fixL:
+                                        say(f"Optimal alignment ({_rng}) at effective length {L_opt:.2f} mm: set "
+                                            f"pivot-to-spindle to {D_opt:.2f} mm (overhang {oh_opt:+.2f} mm), "
+                                            f"offset angle {alpha_opt:.2f} deg "
+                                            f"(fitted: pivot-spindle {D_fit:.2f} mm, offset angle {alpha_fit:.2f} deg)")
+                                    else:
+                                        say(f"Optimal alignment ({_rng}) at pivot-spindle {D_opt:.1f} mm: "
+                                            f"overhang {oh_opt:+.2f} mm (Leff {L_opt:.2f} mm), "
+                                            f"offset angle {alpha_opt:.2f} deg "
+                                            f"(fitted: overhang {oh_fit:+.2f} mm, offset angle {alpha_fit:.2f} deg)")
+                                    _col = {"Overhang (mm)": f"{oh_opt:+.2f}",
                                             "Offset angle (deg)": f"{alpha_opt:.2f}",
                                             "Nulls (mm)": f"{_t1:.1f} & {_t2:.1f} (target)",
                                             f"Offset ({_unit})": "same (fixed)",
                                             "R²": "—"}
+                                    if _fixL:
+                                        _col["Effective length (mm)"] = f"{L_opt:.2f} (given)"
+                                        _col["Pivot-spindle (mm)"] = f"{D_opt:.2f}"
+                                    else:
+                                        _col["Pivot-spindle (mm)"] = f"{D_opt:.1f} (given)"
+                                        _col["Leff (mm)"] = f"{L_opt:.2f}"
                                     phase_fit_table = [(lbl, fv, _col.get(lbl)) for lbl, fv, _ in phase_fit_table]
+                                elif _fixL:
+                                    say(f"Optimal alignment: target nulls {_t1:.1f}/{_t2:.1f} mm cannot be reached "
+                                        f"with effective length {_L0:.2f} mm. No solution.", "warn")
                                 else:
                                     say(f"Optimal alignment: target nulls {_t1:.1f}/{_t2:.1f} mm are farther "
-                                        f"apart than pivot-spindle distance {_D:.1f} mm allows. No solution.", "warn")
+                                        f"apart than pivot-spindle distance {_D0:.1f} mm allows. No solution.", "warn")
                 except Exception as _e:
                     say(f"Tracking-error fit failed ({_e}). Fit not applied.", "warn")
 
@@ -908,7 +955,170 @@ def opt_float(label, default, key, help=None):
     return val if use else None
 
 
+GUIDE_MD = """
+## What this app does
+
+You upload a stereo recording (needle drop) of a **single-tone test record**. The app follows the tone through
+the whole recording and shows, frame by frame:
+
+- the **R-L phase difference** (positive = right channel leads left),
+- the equivalent **time delay** between the channels (phase / (2 pi f)),
+- the **level** of each channel (dBFS),
+- the **2nd harmonic** of each channel relative to the tone (dB).
+
+Time is converted to **groove radius** using the record profile (the tone band has constant pitch, so radius is
+linear in time). A **tracking-error curve** is then fitted to the phase-versus-radius curve, so you can see where
+your tonearm geometry puts its alignment nulls and compare with an optimal (Loefgren A) alignment.
+
+## Quick start
+
+1. Upload a stereo **WAV or FLAC** (FLAC is about half the size and uploads faster).
+2. Pick the **Record** (Sperling or clearaudio). The **Tone frequency** box fills in the record's tone
+   (Sperling 1000 Hz, clearaudio 3150 Hz).
+3. In *Tracking-error fit*, choose the **Fit model** that matches your arm and check its fixed value: the
+   measured **Pivot-to-spindle (mm)** for a fixed-pivot arm, or the **Effective length (mm)** for an arm with
+   a fixed effective length and an adjustable base.
+4. Press **Run analysis** (top of the sidebar). Long recordings take a while; a progress bar is shown.
+5. Read the result tabs, the fit table and the processing log. Download the PNG pages or the CSV if you want them.
+
+## The recording
+
+- Must be **stereo** (two channels). Mono files are rejected.
+- Record the whole tone band, and start recording before the needle drop so the start of the tone is clean.
+- The app detects where the tone starts and ends from the signal level. Needle-drop clicks shorter than the
+  *hold time* are ignored.
+- Streamlit limits uploads to 200 MB by default. If a file is refused, use FLAC, or raise `server.maxUploadSize`
+  in the Streamlit configuration.
+
+## Settings
+
+**Record and tone frequency (top of the sidebar, update immediately)**
+
+- *Record*: Sperling, clearaudio, or "none (time axis)" for any other record (no radius, no fit).
+- *Tone frequency*: the frequency that peak mode tracks. It follows the selected record and can be edited.
+  A wrong value here makes the app track noise, which shows up as huge random phase values.
+
+**Analysis**
+
+- *Mode*: **peak** tracks the tone near the tone frequency (use this for single-tone records). **sweep** follows the
+  strongest bin in a band (for sweeps). **broadband** takes a magnitude-weighted phase over a band (no 2nd harmonic).
+- *Search window*: how far from the tone frequency the peak is searched, in Hz. Peak mode only.
+- *Sweep band / Broadband band*: frequency limits for those two modes. The broadband default is 900-1100 Hz,
+  so change it if you use broadband mode on the 3150 Hz record.
+- *FFT size and Hop size*: analysis frame length and step. A larger FFT gives finer frequency resolution but
+  coarser time resolution. Defaults 32768 and 2048.
+- *Smoothing (ms)*: moving average over the curves. Default 18000 ms. Longer smoothing gives a calmer curve and
+  makes the fit less sensitive to local wiggles, but hides fast changes. 0 turns it off.
+- *Phase unit*, *Unwrap phase*, *Title text*, and optional *fixed phase y-axis limits*.
+
+**Record profile**
+
+- *Record side (rpm)*: **auto** picks the side whose band length matches the detected tone length.
+- *Radius alignment*: **both** detects tone start and end and stretches the radius scale to fit (this absorbs
+  turntable speed error, shown as "speed" in the log). **onset** detects the start and assumes the nominal
+  duration. **manual** starts at *Manual tone start (s)*.
+- *X-axis min / max*, and *Outer radius on the left* (playback order).
+- *Allowed span deviation*: if the detected tone length differs from every side of the profile by more than this,
+  the app assumes the wrong profile or a partial recording and plots against **time** instead, with a warning.
+- *Tone detect*: dB below the 90th-percentile level, and hold time. Lower these if the tone is not found.
+
+**2nd harmonic**
+
+- *Normalise to radius*: scales the harmonic percentage by r / r_ref, so values at different radii are comparable.
+  The reference radius defaults to the outer radius of the band. Tick *set manually* to use another one.
+- *Also show un-normalised*: draws the raw curves dashed for comparison.
+
+**Tracking-error fit**
+
+- *Fit model*: choose the one that matches how your arm is built. Both geometry models are the exact
+  pivoted-arm model and derive the null radii from the fitted geometry.
+  - **Geometry: fixed pivot-to-spindle** is for an arm whose pivot-to-spindle distance is fixed. It fits the
+    overhang (and so the effective length) and the headshell offset angle.
+  - **Geometry: fixed effective length** is for an arm with a fixed effective length and an adjustable base,
+    such as an SME. It fits the pivot-to-spindle distance (overhang = effective length minus pivot-to-spindle)
+    and the offset angle. The optimal alignment then tells you which pivot-to-spindle distance to set.
+  - **Shape** is an abstract fit with free null radii.
+- *Pivot-to-spindle (mm)*: the fixed, measured value for the fixed-pivot model. Not used by the other models.
+- *Effective length (mm)*: the arm's pivot-to-stylus distance from its specification, for the fixed-length
+  model. Not used by the other models.
+- *Start guesses*: overhang and offset angle (both geometry models), or the two nulls (shape). Only the
+  starting point of the fit. In the fixed-length model the start for the pivot-to-spindle distance is the
+  effective length minus the overhang guess.
+- *Known constant phase offset c*: tick *set manually* and enter the value. Default 0. See the note below.
+- *Trim each end*: seconds removed from both ends of the file before fitting, to avoid edge effects. Default 10 s.
+  The smoothing average is pulled toward zero in the first and last half-window of the file, so **keep the trim
+  at least half the smoothing value** (default 18 s smoothing needs 9 s or more; 40 s smoothing needs 20 s or
+  more). This assumes the file starts and ends on the tone. If the file has silence or noise before or after
+  the tone, that noise is smeared into the edges of the tone band, so increase the trim by the length of that
+  lead-in and run-out as well.
+- *Show optimal (Loefgren A) curve*: plots the curve you would get with an optimal alignment and the same c.
+  For the fixed-pivot model that is at the same pivot-to-spindle distance. For the fixed-length model it is at
+  the same effective length, and the table gives the pivot-to-spindle distance that achieves it.
+  *Loefgren R1 / R2* set the inner and outer groove radii it is
+  optimised for (defaults 60.3 and 146.05 mm). Untick *set manually* to use the record's own band.
+
+**Show page 2** adds a second figure with only phase and 2nd harmonic, plus the fit table.
+
+### About the constant phase offset c
+
+The curve shape alone cannot separate a constant phase offset from the position of the nulls: different
+combinations give an identical curve. So:
+
+- With **c fixed** (ticked), overhang, offset angle and null positions are all determined, and the optimal
+  curve is available.
+- With **c free** (unticked), the app reports the fitted geometry (overhang and Leff, or the pivot-to-spindle
+  distance for the fixed-length model), but offset angle and nulls are shown as
+  *indeterminate*, and no optimal curve is drawn.
+
+Only fix c to a value you know independently. The cause of a constant R-L phase offset (cartridge, cabling,
+electronics, mastering) is not established by this analysis.
+
+## Reading the results
+
+- **Page 1** shows phase, delay, level and 2nd harmonic against groove radius (or time).
+- **Page 2** shows phase with the fitted curve, the nulls, and the optimal curve, plus 2nd harmonic and the fit table.
+- **Tracked frequency** shows the frequency found in each frame. It should be a flat line at the tone
+  frequency. If it is not, the tone frequency or the record choice is wrong.
+- **Fit table**: *Fitted* is what the recording shows. *Optimal (target)* is the Loefgren A alignment for the
+  chosen groove range. R-squared tells you how well the model matches the smoothed phase curve.
+- **Red dashed lines** mark the profile's marker radii (for Sperling, the IEC nulls at 120.9 and 66.0 mm).
+- **Processing log** lists what was detected: tone start and end, side, speed deviation, fit result.
+  Warnings are also shown at the top of the results.
+- **Download time series CSV** contains time, radius, phase, coherence, levels, tracked frequency, delay, the
+  harmonic columns, the fitted phase and the normalised harmonics.
+
+## Troubleshooting
+
+- **Phase in the thousands of degrees, or random wiggles**: the tone frequency does not match the record.
+  Choose the right record or enter the frequency by hand.
+- **"Plotting vs TIME" warning**: the detected tone length does not match the profile. Wrong record, partial
+  recording, or a strong speed error. Choose the record side explicitly to force radius, or raise the allowed
+  span deviation.
+- **"Tone not detected"**: raise *Tone detect: dB below 90th percentile* (a more tolerant threshold) or shorten
+  the hold time. Also check that the recording contains the tone at a good level.
+- **"Fit not applied"**: the fit needs a record profile (radius axis) and the fixed value of the chosen model
+  (pivot-to-spindle distance or effective length).
+- **Fit curve does not follow the data**: look at the smoothing, the trim, and the x-axis limits, and check
+  that c and the pivot-to-spindle distance are right.
+- **Analysis failed**: the message shown names the cause, for example a mono file or a silent file.
+
+## Adding your own record
+
+Add an entry to `RECORD_PROFILES` in `app.py` with a label, `tone_hz`, one or more sides (rpm, band duration in
+seconds, start and end radius in mm) and optional marker radii. It then appears in the Record list.
+
+*This app is experimental. Check the results against your own expectations before relying on them.*
+"""
+
+
+@st.dialog("User guide", width="large")
+def show_guide():
+    st.markdown(GUIDE_MD)
+
+
 with st.sidebar:
+    if st.button("📖 User guide", width="stretch", key="open_guide"):
+        show_guide()
     st.header("Settings")
     # Record and tone frequency sit OUTSIDE the form so they update immediately when the record is
     # changed: the frequency box then shows the record's real tone (Sperling 1000 Hz, clearaudio 3150 Hz)
@@ -967,10 +1177,23 @@ with st.sidebar:
 
         with st.expander("Tracking-error fit", expanded=True):
             PHASE_FIT_TRACKING_ERROR = st.checkbox("Fit tracking-error curve", value=D["PHASE_FIT_TRACKING_ERROR"])
-            PHASE_FIT_MODEL = st.selectbox("Fit model", ["geometry", "shape"], index=0,
-                                           help="geometry: exact pivoted-arm model, fits overhang and offset angle for your "
-                                                "pivot-to-spindle distance. shape: c + k(r-n1)(r-n2)/r with free nulls.")
-            PHASE_FIT_PIVOT_SPINDLE_MM = st.number_input("Pivot-to-spindle (mm), geometry", value=D["PHASE_FIT_PIVOT_SPINDLE_MM"], format="%.2f")
+            _fit_labels = {"geometry": "Geometry: fixed pivot-to-spindle",
+                           "geometry_L": "Geometry: fixed effective length",
+                           "shape": "Shape (free nulls)"}
+            PHASE_FIT_MODEL = st.selectbox("Fit model", list(_fit_labels), index=0,
+                                           format_func=_fit_labels.get,
+                                           help="Geometry, fixed pivot-to-spindle: exact pivoted-arm model for an arm whose "
+                                                "pivot-to-spindle distance is fixed; fits overhang (so effective length) and "
+                                                "offset angle. Geometry, fixed effective length: for an arm with a fixed "
+                                                "effective length and an adjustable base (e.g. SME); fits the pivot-to-spindle "
+                                                "distance and offset angle. Shape: c + k(r-n1)(r-n2)/r with free nulls.")
+            PHASE_FIT_PIVOT_SPINDLE_MM = st.number_input("Pivot-to-spindle (mm), fixed-pivot geometry",
+                                                         value=D["PHASE_FIT_PIVOT_SPINDLE_MM"], format="%.2f",
+                                                         help="Used by 'Geometry: fixed pivot-to-spindle'.")
+            PHASE_FIT_EFF_LENGTH_MM = st.number_input("Effective length (mm), fixed-length geometry",
+                                                      value=D["PHASE_FIT_EFF_LENGTH_MM"], format="%.2f",
+                                                      help="Used by 'Geometry: fixed effective length'. Pivot to stylus "
+                                                           "distance of your arm, from its specification.")
             PHASE_FIT_OVERHANG_GUESS_MM = st.number_input("Overhang start guess (mm)", value=D["PHASE_FIT_OVERHANG_GUESS_MM"], format="%.2f")
             PHASE_FIT_OFFSET_ANGLE_GUESS_DEG = st.number_input("Offset angle start guess (deg)", value=D["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"], format="%.2f")
             c1, c2 = st.columns(2)
@@ -1003,7 +1226,8 @@ cfg = dict(
     SHOW_PAGE2=SHOW_PAGE2,
     PHASE_FIT_TRACKING_ERROR=PHASE_FIT_TRACKING_ERROR, PHASE_FIT_MODEL=PHASE_FIT_MODEL,
     PHASE_FIT_N1_GUESS_MM=PHASE_FIT_N1_GUESS_MM, PHASE_FIT_N2_GUESS_MM=PHASE_FIT_N2_GUESS_MM,
-    PHASE_FIT_PIVOT_SPINDLE_MM=PHASE_FIT_PIVOT_SPINDLE_MM, PHASE_FIT_OVERHANG_GUESS_MM=PHASE_FIT_OVERHANG_GUESS_MM,
+    PHASE_FIT_PIVOT_SPINDLE_MM=PHASE_FIT_PIVOT_SPINDLE_MM, PHASE_FIT_EFF_LENGTH_MM=PHASE_FIT_EFF_LENGTH_MM,
+    PHASE_FIT_OVERHANG_GUESS_MM=PHASE_FIT_OVERHANG_GUESS_MM,
     PHASE_FIT_OFFSET_ANGLE_GUESS_DEG=PHASE_FIT_OFFSET_ANGLE_GUESS_DEG, PHASE_FIT_TRIM_S=PHASE_FIT_TRIM_S,
     PHASE_FIT_SHOW_OPTIMAL=PHASE_FIT_SHOW_OPTIMAL, PHASE_FIT_LOFGREN_R1_MM=PHASE_FIT_LOFGREN_R1_MM,
     PHASE_FIT_LOFGREN_R2_MM=PHASE_FIT_LOFGREN_R2_MM, PHASE_FIT_OFFSET_DEG=PHASE_FIT_OFFSET_DEG,

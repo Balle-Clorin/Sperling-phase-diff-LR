@@ -975,9 +975,10 @@ your tonearm geometry puts its alignment nulls and compare with an optimal (Loef
 1. Upload a stereo **WAV or FLAC** (FLAC is about half the size and uploads faster).
 2. Pick the **Record** (Sperling or clearaudio). The **Tone frequency** box fills in the record's tone
    (Sperling 1000 Hz, clearaudio 3150 Hz).
-3. In *Tracking-error fit*, choose the **Fit model** that matches your arm and check its fixed value: the
-   measured **Pivot-to-spindle (mm)** for a fixed-pivot arm, or the **Effective length (mm)** for an arm with
-   a fixed effective length and an adjustable base.
+3. Choose the **Tracking-error fit model** (top of the sidebar) that matches your arm, then check its fixed
+   value in *Tracking-error fit*: the measured **Pivot-to-spindle (mm)** for a fixed-pivot arm, or the
+   **Effective length (mm)** for an arm with a fixed effective length and an adjustable base. Only the fields
+   of the chosen model are shown.
 4. Press **Run analysis** (top of the sidebar). Long recordings take a while; a progress bar is shown.
 5. Read the result tabs, the fit table and the processing log. Download the PNG pages or the CSV if you want them.
 
@@ -1030,7 +1031,8 @@ your tonearm geometry puts its alignment nulls and compare with an optimal (Loef
 
 **Tracking-error fit**
 
-- *Fit model*: choose the one that matches how your arm is built. Both geometry models are the exact
+- *Tracking-error fit model* (top of the sidebar, next to Record): choose the one that matches how your arm
+  is built. It is either-or: the fields of the other models are hidden. Both geometry models are the exact
   pivoted-arm model and derive the null radii from the fitted geometry.
   - **Geometry: fixed pivot-to-spindle** is for an arm whose pivot-to-spindle distance is fixed. It fits the
     overhang (and so the effective length) and the headshell offset angle.
@@ -1129,6 +1131,18 @@ with st.sidebar:
     FREQ_CENTER = st.number_input("Tone frequency (Hz), peak mode", value=float(_hz_default), min_value=1.0,
                                   step=10.0, key=f"tone_hz_{prof_choice}",
                                   help="Defaults to the selected record's tone. Edit it to track a different frequency.")
+    # Fit model is also outside the form: the fields below it (fixed pivot-to-spindle OR fixed effective
+    # length OR the shape guesses) are shown or hidden immediately, so only the relevant ones appear.
+    _fit_labels = {"geometry": "Geometry: fixed pivot-to-spindle",
+                   "geometry_L": "Geometry: fixed effective length",
+                   "shape": "Shape (free nulls)"}
+    PHASE_FIT_MODEL = st.selectbox("Tracking-error fit model", list(_fit_labels), index=0,
+                                   format_func=_fit_labels.get, key="fit_model",
+                                   help="Fixed pivot-to-spindle: exact pivoted-arm model for an arm whose pivot-to-spindle "
+                                        "distance is fixed; fits overhang (so effective length) and offset angle. "
+                                        "Fixed effective length: for an arm with a fixed effective length and an "
+                                        "adjustable base (e.g. SME); fits the pivot-to-spindle distance and offset angle. "
+                                        "Shape: c + k(r-n1)(r-n2)/r with free nulls.")
     with st.form("settings"):
         # Submit button first, so it sits at the top of the form (it still submits every widget below it).
         submitted = st.form_submit_button("Run analysis", type="primary", width="stretch")
@@ -1177,28 +1191,31 @@ with st.sidebar:
 
         with st.expander("Tracking-error fit", expanded=True):
             PHASE_FIT_TRACKING_ERROR = st.checkbox("Fit tracking-error curve", value=D["PHASE_FIT_TRACKING_ERROR"])
-            _fit_labels = {"geometry": "Geometry: fixed pivot-to-spindle",
-                           "geometry_L": "Geometry: fixed effective length",
-                           "shape": "Shape (free nulls)"}
-            PHASE_FIT_MODEL = st.selectbox("Fit model", list(_fit_labels), index=0,
-                                           format_func=_fit_labels.get,
-                                           help="Geometry, fixed pivot-to-spindle: exact pivoted-arm model for an arm whose "
-                                                "pivot-to-spindle distance is fixed; fits overhang (so effective length) and "
-                                                "offset angle. Geometry, fixed effective length: for an arm with a fixed "
-                                                "effective length and an adjustable base (e.g. SME); fits the pivot-to-spindle "
-                                                "distance and offset angle. Shape: c + k(r-n1)(r-n2)/r with free nulls.")
-            PHASE_FIT_PIVOT_SPINDLE_MM = st.number_input("Pivot-to-spindle (mm), fixed-pivot geometry",
-                                                         value=D["PHASE_FIT_PIVOT_SPINDLE_MM"], format="%.2f",
-                                                         help="Used by 'Geometry: fixed pivot-to-spindle'.")
-            PHASE_FIT_EFF_LENGTH_MM = st.number_input("Effective length (mm), fixed-length geometry",
-                                                      value=D["PHASE_FIT_EFF_LENGTH_MM"], format="%.2f",
-                                                      help="Used by 'Geometry: fixed effective length'. Pivot to stylus "
-                                                           "distance of your arm, from its specification.")
-            PHASE_FIT_OVERHANG_GUESS_MM = st.number_input("Overhang start guess (mm)", value=D["PHASE_FIT_OVERHANG_GUESS_MM"], format="%.2f")
-            PHASE_FIT_OFFSET_ANGLE_GUESS_DEG = st.number_input("Offset angle start guess (deg)", value=D["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"], format="%.2f")
-            c1, c2 = st.columns(2)
-            PHASE_FIT_N1_GUESS_MM = c1.number_input("Inner null guess (mm), shape", value=D["PHASE_FIT_N1_GUESS_MM"])
-            PHASE_FIT_N2_GUESS_MM = c2.number_input("Outer null guess (mm), shape", value=D["PHASE_FIT_N2_GUESS_MM"])
+            st.caption(f"Model: **{_fit_labels[PHASE_FIT_MODEL]}** (change it at the top of the sidebar)")
+            # Show only the fields that the chosen model uses; the others keep their defaults and are not used.
+            PHASE_FIT_PIVOT_SPINDLE_MM = D["PHASE_FIT_PIVOT_SPINDLE_MM"]
+            PHASE_FIT_EFF_LENGTH_MM = D["PHASE_FIT_EFF_LENGTH_MM"]
+            PHASE_FIT_OVERHANG_GUESS_MM = D["PHASE_FIT_OVERHANG_GUESS_MM"]
+            PHASE_FIT_OFFSET_ANGLE_GUESS_DEG = D["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"]
+            PHASE_FIT_N1_GUESS_MM = D["PHASE_FIT_N1_GUESS_MM"]
+            PHASE_FIT_N2_GUESS_MM = D["PHASE_FIT_N2_GUESS_MM"]
+            if PHASE_FIT_MODEL == "geometry":
+                PHASE_FIT_PIVOT_SPINDLE_MM = st.number_input("Pivot-to-spindle (mm), fixed",
+                                                             value=D["PHASE_FIT_PIVOT_SPINDLE_MM"], format="%.2f",
+                                                             help="Your arm's measured pivot-to-spindle distance. Not fitted.")
+            elif PHASE_FIT_MODEL == "geometry_L":
+                PHASE_FIT_EFF_LENGTH_MM = st.number_input("Effective length (mm), fixed",
+                                                          value=D["PHASE_FIT_EFF_LENGTH_MM"], format="%.2f",
+                                                          help="Pivot to stylus distance of your arm, from its "
+                                                               "specification. Not fitted; the pivot-to-spindle "
+                                                               "distance is fitted instead.")
+            if PHASE_FIT_MODEL in ("geometry", "geometry_L"):
+                PHASE_FIT_OVERHANG_GUESS_MM = st.number_input("Overhang start guess (mm)", value=D["PHASE_FIT_OVERHANG_GUESS_MM"], format="%.2f")
+                PHASE_FIT_OFFSET_ANGLE_GUESS_DEG = st.number_input("Offset angle start guess (deg)", value=D["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"], format="%.2f")
+            else:
+                c1, c2 = st.columns(2)
+                PHASE_FIT_N1_GUESS_MM = c1.number_input("Inner null guess (mm), shape", value=D["PHASE_FIT_N1_GUESS_MM"])
+                PHASE_FIT_N2_GUESS_MM = c2.number_input("Outer null guess (mm), shape", value=D["PHASE_FIT_N2_GUESS_MM"])
             PHASE_FIT_OFFSET_DEG = opt_float("Known constant phase offset c", D["PHASE_FIT_OFFSET_DEG"], "cfix",
                                              help="Checked: c is fixed to this value, making offset angle and nulls identifiable. "
                                                   "Unchecked: c is fitted, and nulls are reported as indeterminate (geometry) "

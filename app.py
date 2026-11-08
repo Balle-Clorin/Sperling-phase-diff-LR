@@ -32,7 +32,7 @@ import streamlit as st
 # App identity (shown in the result header)
 # ---------------------------
 SCRIPT_NAME = "ANYSIGNAL_-phasediff_2harm_sweep"
-SCRIPT_REV = "R15-web1"
+SCRIPT_REV = "R15-web2"
 
 # ---------------------------
 # Fixed constants (as in R15)
@@ -82,6 +82,11 @@ DEFAULTS = dict(
     PHASE_FIT_OFFSET_ANGLE_GUESS_DEG=23.6, PHASE_FIT_TRIM_S=10.0,
     PHASE_FIT_SHOW_OPTIMAL=True, PHASE_FIT_LOFGREN_R1_MM=60.3, PHASE_FIT_LOFGREN_R2_MM=146.05,
     PHASE_FIT_OFFSET_DEG=0.0,
+    # Angular error: phase is not proportional to tracking angle error. At a given angular error the phase grows
+    # as the groove gets slower and the recorded wavelength shorter, ~ (r_ref/r)^p with p = 1 for a response
+    # proportional to 1/groove speed. ANG_NORM converts phase to angular error (units: degrees of phase this angular
+    # error would give at r_ref) and the geometry fits use the same response. ANG_NORM=False gives R15 behaviour.
+    ANG_NORM=True, ANG_REF_MM=None, ANG_EXPONENT=1.0,
 )
 
 
@@ -424,6 +429,15 @@ def run_analysis(path, display_name, C, progress=None):
     phase_fit_table = None
     PHASE_FIT_MODEL = C["PHASE_FIT_MODEL"]
 
+    # angular-error conversion settings (needs the radius axis)
+    ang_p = float(C["ANG_EXPONENT"])
+    ang_ref_mm = None
+    if C["ANG_NORM"] and RADIUS_MODE:
+        ang_ref_mm = float(C["ANG_REF_MM"]) if C["ANG_REF_MM"] else max(sp_r0, sp_r1)
+    ang_c_used = None          # offset c that the fit used (fixed or fitted), reused for the angular-error curve
+    ang_fit_curve = None       # k * E(r) of the fitted geometry, in the same units as the angular error
+    ang_opt_curve = None       # k * E(r) of the optimal alignment, same units
+
     if C["PHASE_FIT_TRACKING_ERROR"]:
         if not RADIUS_MODE:
             say("Tracking-error fit needs an active record profile (radius axis). Fit not applied.", "warn")
@@ -442,6 +456,14 @@ def run_analysis(path, display_name, C, progress=None):
                 _r_lo, _r_hi = min(sp_r0, sp_r1), max(sp_r0, sp_r1)
                 _c_fixed = C["PHASE_FIT_OFFSET_DEG"]
                 _unit = "deg" if PHASE_UNIT == "degrees" else "rad"
+                # Response weight: phase = c + k * W(r) * E(r) with W = (r_ref/r)^p, so k is the phase per degree
+                # of angular error at r_ref. W = 1 (R15 behaviour) when the conversion is off or in shape mode.
+                _ang_geo = (ang_ref_mm is not None) and PHASE_FIT_MODEL != "shape"
+
+                def _W(r):
+                    if not _ang_geo:
+                        return 1.0
+                    return (ang_ref_mm / np.maximum(np.asarray(r, float), 1.0)) ** ang_p
                 # geometry: pivot-to-spindle D is fixed, effective length L = D + overhang is fitted.
                 # geometry_L: effective length L is fixed (e.g. SME), D = L - overhang is fitted
                 # (the arm base is adjustable). In both cases the free parameter is the overhang.
@@ -479,17 +501,63 @@ def run_analysis(path, display_name, C, progress=None):
                     if _c_fixed is None:
                         def _resid(params, r, y):
                             c, k, oh, alpha = params
-                            return c + k * _E_deg(r, *_LD(oh), alpha) - y
+                            return c + k * _W(r) * _E_deg(r, *_LD(oh), alpha) - y
                         _p0 = [float(np.mean(_pf)), 0.03, C["PHASE_FIT_OVERHANG_GUESS_MM"], C["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"]]
                         _bounds = ([-np.inf, -np.inf, _oh_lo, _al_lo], [np.inf, np.inf, _oh_hi, _al_hi])
                     else:
                         def _resid(params, r, y):
                             k, oh, alpha = params
-                            return _c_fixed + k * _E_deg(r, *_LD(oh), alpha) - y
+                            return _c_fixed + k * _W(r) * _E_deg(r, *_LD(oh), alpha) - y
                         _p0 = [0.03, C["PHASE_FIT_OVERHANG_GUESS_MM"], C["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"]]
                         _bounds = ([-np.inf, _oh_lo, _al_lo], [np.inf, _oh_hi, _al_hi])
+                _starts = [_p0]
+                if ang_ref_mm is not None and PHASE_FIT_MODEL != "shape":
+                    # Weighted (angular-error) geometry fit: k is the phase per degree at r_ref, typically ~1, and
+                    # R15's start k = 0.03 can end in the inverted local minimum (negative k, angle at its limit).
+                    # Add a start from a coarse grid over (overhang, offset angle) with k (and c) solved in closed
+                    # form, preferring positive k (curve with its ends up). R15's own start is kept as a second
+                    # start and the lower-error result wins, so this is never worse than the R15 start.
+                    def _grid_start():
+                        _sub = max(1, len(_rf) // 400)
+                        _rs, _ys = _rf[::_sub], _pf[::_sub]
+                        _w = _W(_rs)
+                        _best = None
+                        for _oh in np.linspace(_oh_lo, _oh_hi, 61):
+                            _Lg, _Dg = _LD(_oh)
+                            if _Dg <= 0 or _Lg <= 0:
+                                continue
+                            for _al in np.linspace(_al_lo, _al_hi, 61):
+                                _B = _w * _E_deg(_rs, _Lg, _Dg, _al)
+                                if _c_fixed is None:
+                                    _Bc = _B - _B.mean()
+                                    _den = float(_Bc @ _Bc)
+                                    if _den <= 0:
+                                        continue
+                                    _k = float(_Bc @ (_ys - _ys.mean())) / _den
+                                    _c = float(_ys.mean() - _k * _B.mean())
+                                else:
+                                    _den = float(_B @ _B)
+                                    if _den <= 0:
+                                        continue
+                                    _c = float(_c_fixed)
+                                    _k = float(_B @ (_ys - _c)) / _den
+                                _cand = (_k <= 0, float(np.sum((_c + _k * _B - _ys) ** 2)), _oh, _al, _k, _c)
+                                if _best is None or _cand[:2] < _best[:2]:
+                                    _best = _cand
+                        _oh, _al, _k, _c = _best[2:]
+                        return [_c, _k, _oh, _al] if _c_fixed is None else [_k, _oh, _al]
+                    try:
+                        _starts.append(_grid_start())
+                    except Exception:
+                        pass
                 try:
-                    _res = opt.least_squares(_resid, _p0, args=(_rf, _pf), bounds=_bounds)
+                    _res = None
+                    for _s0 in _starts:
+                        # residual taken in the angular-error domain: (model - phase) / W(r) = k*E(r) - (phase - c)*(r/r_ref)^p
+                        _try = opt.least_squares(lambda _pp, _r, _y: _resid(_pp, _r, _y) / _W(_r), _s0,
+                                                 args=(_rf, _pf), bounds=_bounds)
+                        if _res is None or _try.cost < _res.cost:
+                            _res = _try
                     _ss_res = float(np.sum(_res.fun ** 2))
                     _ss_tot = float(np.sum((_pf - np.mean(_pf)) ** 2))
                     r2_fit = 1.0 - _ss_res / _ss_tot if _ss_tot > 0 else float('nan')
@@ -503,6 +571,7 @@ def run_analysis(path, display_name, C, progress=None):
                         if n1_fit > n2_fit:
                             n1_fit, n2_fit = n2_fit, n1_fit
                         phase_fit_curve = c_fit + k_fit * (radius_mm - n1_fit) * (radius_mm - n2_fit) / radius_mm
+                        ang_c_used = float(c_fit)
                         phase_fit_active = True
                         phase_fit_nulls = (n1_fit, n2_fit)
                         phase_fit_note = (f"Tracking-error fit (shape): nulls at {n1_fit:.1f} & {n2_fit:.1f} mm, "
@@ -526,7 +595,10 @@ def run_analysis(path, display_name, C, progress=None):
                             k_fit, oh_fit, alpha_fit = _res.x
                             c_fit = _c_fixed
                         L_fit, D_fit = _LD(oh_fit)
-                        phase_fit_curve = c_fit + k_fit * _E_deg(radius_mm, L_fit, D_fit, alpha_fit)
+                        phase_fit_curve = c_fit + k_fit * _W(radius_mm) * _E_deg(radius_mm, L_fit, D_fit, alpha_fit)
+                        ang_c_used = float(c_fit)
+                        if _ang_geo:
+                            ang_fit_curve = k_fit * _E_deg(radius_mm, L_fit, D_fit, alpha_fit)
                         phase_fit_active = True
                         if _fixL:
                             _mname = "geometry, fixed length"
@@ -542,6 +614,8 @@ def run_analysis(path, display_name, C, progress=None):
                             _geo_rows = [("Pivot-spindle (mm)", f"{D_fit:.1f} (given)"),
                                          ("Overhang (mm)", f"{oh_fit:+.2f}"),
                                          ("Leff (mm)", f"{L_fit:.2f}")]
+                        _klabel = (f"k at r_ref ({_unit} phase per deg)" if _ang_geo else f"k ({_unit} phase per deg)")
+                        _geo_rows.append((_klabel, f"{k_fit:.3f}"))
                         if _c_fixed is None:
                             # Offset angle is exactly degenerate with the free constant c (alpha only enters E(r)
                             # as an additive constant), so nulls are not determined by the curve shape.
@@ -605,7 +679,9 @@ def run_analysis(path, display_name, C, progress=None):
                                         _opt_ok = True
                                 if _opt_ok:
                                     oh_opt = L_opt - D_opt
-                                    phase_opt_curve = c_fit + k_fit * _E_deg(radius_mm, L_opt, D_opt, alpha_opt)
+                                    phase_opt_curve = c_fit + k_fit * _W(radius_mm) * _E_deg(radius_mm, L_opt, D_opt, alpha_opt)
+                                    if _ang_geo:
+                                        ang_opt_curve = k_fit * _E_deg(radius_mm, L_opt, D_opt, alpha_opt)
                                     phase_opt_nulls = (_t1, _t2)
                                     _rng = (f"Löfgren A for {_lg_r1:.2f}-{_lg_r2:.2f} mm groove range "
                                             f"-> nulls {_t1:.1f} & {_t2:.1f} mm")
@@ -630,6 +706,7 @@ def run_analysis(path, display_name, C, progress=None):
                                     else:
                                         _col["Pivot-spindle (mm)"] = f"{D_opt:.1f} (given)"
                                         _col["Leff (mm)"] = f"{L_opt:.2f}"
+                                    _col[_klabel] = "same"
                                     phase_fit_table = [(lbl, fv, _col.get(lbl)) for lbl, fv, _ in phase_fit_table]
                                 elif _fixL:
                                     say(f"Optimal alignment: target nulls {_t1:.1f}/{_t2:.1f} mm cannot be reached "
@@ -639,6 +716,29 @@ def run_analysis(path, display_name, C, progress=None):
                                         f"apart than pivot-spindle distance {_D0:.1f} mm allows. No solution.", "warn")
                 except Exception as _e:
                     say(f"Tracking-error fit failed ({_e}). Fit not applied.", "warn")
+
+    # ---------------- angular error: phase converted with the 1/r response ----------------
+    # angular error (phase-equivalent at r_ref) = (phase - c) * (r / r_ref)^p
+    ang_active = False
+    ang_err = np.full(len(times), np.nan)
+    ang_note = ""
+    if C["ANG_NORM"]:
+        if not RADIUS_MODE:
+            say("Angular-error conversion needs an active record profile (radius axis). Not applied.", "warn")
+        else:
+            if ang_c_used is not None:
+                _c_ang, _c_src = ang_c_used, ("fixed" if C["PHASE_FIT_OFFSET_DEG"] is not None else "fitted")
+            else:
+                _c_ang = float(C["PHASE_FIT_OFFSET_DEG"]) if C["PHASE_FIT_OFFSET_DEG"] is not None else 0.0
+                _c_src = "set manually" if C["PHASE_FIT_OFFSET_DEG"] is not None else "assumed 0, no fit"
+            ang_err = (phase_smooth - _c_ang) * (np.maximum(radius_mm, 1.0) / ang_ref_mm) ** ang_p
+            ang_active = True
+            _u = "deg" if PHASE_UNIT == "degrees" else "rad"
+            ang_note = (f"Angular error: (phase - c) x (r / {ang_ref_mm:.2f} mm)^{ang_p:g}, c = {_c_ang:+.3f} {_u} ({_c_src}); "
+                        f"units: {_u} of phase this angular error gives at {ang_ref_mm:.2f} mm")
+            say(ang_note)
+            if ang_p != 0 and PHASE_FIT_MODEL == "shape":
+                say("The shape fit does not use the 1/r response, so no model curve is drawn on the angular-error plot.", "warn")
 
     L_smooth = smooth_signal(level_L, sr_frames, SMOOTH_MS)
     R_smooth = smooth_signal(level_R, sr_frames, SMOOTH_MS)
@@ -698,6 +798,8 @@ def run_analysis(path, display_name, C, progress=None):
         "harmonic_db_R": harmonic_db_R_smooth,
         "harmonic_valid_R": harmonic_valid_R.astype(int),
         "phase_fit": phase_fit_curve if phase_fit_active else np.full(n, np.nan),
+        "angular_error_phase_equiv": ang_err,
+        "angular_error_fit": ang_fit_curve if ang_fit_curve is not None else np.full(n, np.nan),
         "harmonic_pct_norm_L": harmonic_pct_norm_L,
         "harmonic_db_norm_L": harmonic_db_norm_L_smooth,
         "harmonic_pct_norm_R": harmonic_pct_norm_R,
@@ -720,6 +822,8 @@ def run_analysis(path, display_name, C, progress=None):
         harmonic_valid_L=harmonic_valid_L, harmonic_valid_R=harmonic_valid_R,
         delay_us_smooth=delay_us_smooth, L_smooth=L_smooth, R_smooth=R_smooth,
         tracked_freqs=tracked_freqs, csv_bytes=csv_bytes,
+        ang_active=ang_active, ang_err=ang_err, ang_fit_curve=ang_fit_curve, ang_opt_curve=ang_opt_curve,
+        ang_ref_mm=ang_ref_mm, ang_p=ang_p, ang_note=ang_note,
     )
 
 
@@ -785,6 +889,31 @@ def draw_phase(ax, legend_y, R, C):
         ax.set_ylim(C["Y_AXIS_LIMITS"])
 
 
+def draw_ang(ax, legend_y, R, C):
+    """Angular error = (phase - c) x (r/r_ref)^p, in degrees of phase at r_ref, with the fitted and optimal
+    geometry curves (k x E(r)) in the same units."""
+    x = R["x_plot"]
+    ref, p = R["ang_ref_mm"], R["ang_p"]
+    handles = [ax.plot(x, R["ang_err"], linewidth=1.5, color="C0",
+                       label=f"Angular error: (phase - c) x (r/{ref:.0f} mm)^{p:g}")[0]]
+    if R["ang_fit_curve"] is not None:
+        handles.append(ax.plot(x, R["ang_fit_curve"], '--', color=FIT_COLOR, linewidth=1.2,
+                               label="Geometry curve (fitted)")[0])
+        if R["phase_fit_nulls"] is not None:
+            for nv in R["phase_fit_nulls"]:
+                ax.axvline(x=nv, color=FIT_COLOR, linewidth=1.0, linestyle=':')
+    if R["ang_opt_curve"] is not None:
+        t1, t2 = R["phase_opt_nulls"]
+        handles.append(ax.plot(x, R["ang_opt_curve"], color='#5ad25a', linewidth=1.3, linestyle=':',
+                               label=f"Optimal alignment (nulls {t1:.1f}, {t2:.1f} mm)")[0])
+    ax.axhline(0.0, color="#888888", linewidth=0.8)
+    unit = "deg" if R["PHASE_UNIT"] == "degrees" else "rad"
+    ax.set_ylabel(f"Angular error ({unit}, phase-equiv. at {ref:.0f} mm)")
+    _grid(ax)
+    ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, legend_y),
+              ncol=min(len(handles), 2), frameon=True)
+
+
 def draw_harm(ax, legend_y, R, C):
     x = R["x_plot"]
     if R["harm_norm_active"]:
@@ -831,6 +960,8 @@ def caption_text(R):
         cap += "    " + R["harm_norm_note"]
     if R["phase_fit_note"]:
         cap += "\n" + R["phase_fit_note"]
+    if R["ang_active"]:
+        cap += "\n" + R["ang_note"]
     return cap
 
 
@@ -878,19 +1009,35 @@ def fig_page2(R, C):
     _style()
     tbl = R["phase_fit_table"]
     table_h = 0.06 * len(tbl) + 0.06 if tbl else 0.0
-    fig = plt.figure(constrained_layout=True, figsize=(12, 9 + table_h * 9))
-    gs = fig.add_gridspec(nrows=4, ncols=1, height_ratios=[1, 1, max(table_h, 0.001), 0.09])
-    ax_p = fig.add_subplot(gs[0, 0])
-    ax_h = fig.add_subplot(gs[1, 0], sharex=ax_p)
-    ax_t = fig.add_subplot(gs[2, 0])
-    ax_c = fig.add_subplot(gs[3, 0])
+    ang = R["ang_active"]
+    if ang:
+        fig = plt.figure(constrained_layout=True, figsize=(12, 13 + table_h * 9))
+        gs = fig.add_gridspec(nrows=5, ncols=1, height_ratios=[1, 1, 1, max(table_h, 0.001), 0.09])
+        ax_p = fig.add_subplot(gs[0, 0])
+        ax_a = fig.add_subplot(gs[1, 0], sharex=ax_p)
+        ax_h = fig.add_subplot(gs[2, 0], sharex=ax_p)
+        ax_t = fig.add_subplot(gs[3, 0])
+        ax_c = fig.add_subplot(gs[4, 0])
+    else:
+        fig = plt.figure(constrained_layout=True, figsize=(12, 9 + table_h * 9))
+        gs = fig.add_gridspec(nrows=4, ncols=1, height_ratios=[1, 1, max(table_h, 0.001), 0.09])
+        ax_p = fig.add_subplot(gs[0, 0])
+        ax_h = fig.add_subplot(gs[1, 0], sharex=ax_p)
+        ax_t = fig.add_subplot(gs[2, 0])
+        ax_c = fig.add_subplot(gs[3, 0])
 
     draw_phase(ax_p, -0.24, R, C)
-    ax_p.set_title(_title(f"R-L phase difference (positive: R leads L) and 2nd harmonic ({R['MODE']})", R, C))
+    ax_p.set_title(_title(f"R-L phase difference (positive: R leads L), angular error and 2nd harmonic ({R['MODE']})"
+                          if ang else f"R-L phase difference (positive: R leads L) and 2nd harmonic ({R['MODE']})", R, C))
     draw_harm(ax_h, -0.16 if R["harm_norm_active"] else -0.13, R, C)
     configure_x_axis(ax_h, R, C)
     ax_p.set_xlabel(ax_h.get_xlabel())
-    draw_markers([ax_p, ax_h], R)
+    if ang:
+        draw_ang(ax_a, -0.24, R, C)
+        ax_a.set_xlabel(ax_h.get_xlabel())
+        draw_markers([ax_p, ax_a, ax_h], R)
+    else:
+        draw_markers([ax_p, ax_h], R)
 
     ax_t.axis('off')
     if tbl:
@@ -1059,7 +1206,26 @@ your tonearm geometry puts its alignment nulls and compare with an optimal (Loef
   *Loefgren R1 / R2* set the inner and outer groove radii it is
   optimised for (defaults 60.3 and 146.05 mm). Untick *set manually* to use the record's own band.
 
-**Show page 2** adds a second figure with only phase and 2nd harmonic, plus the fit table.
+**Angular error (phase to angle conversion)**
+
+- Phase is not the same thing as angular error. At a constant angular error the stylus reads the two groove
+  walls at slightly different positions along the groove, so the channel phase grows as the groove gets
+  slower and the recorded wavelength shorter: the same angular error gives about twice the phase at 60 mm as at
+  120 mm. The app therefore converts phase to angular error as **(phase - c) x (r / r_ref)^p**.
+- *Reference radius*: unticked = the outer radius of the band. The result is in **degrees of phase this angular
+  error would produce at the outer radius**, so the outer end of the curve is unchanged and the inner part is
+  scaled down. It is a relative unit: to get real degrees you also need the phase per degree of angular error at
+  r_ref, which the fit table reports as *k at r_ref* (it is only as reliable as the model).
+- *Exponent p*: 1 means a response proportional to 1/r (groove speed). 0 switches the conversion off. Values
+  between 1 and 2 are worth trying if the converted curves for different cartridge settings still differ by a tilt.
+- The geometry fits use the same response, so phase = c + k x (r_ref / r)^p x E(r), where E(r) is the exact
+  tracking angle error of the arm. With the conversion on, the constant c and the offset angle are no longer
+  exchangeable, because c is multiplied by r in the angular-error curve while the offset angle is not.
+- The shape fit does not use the response; for that model the angular-error plot shows the converted data only.
+- Tick off *Convert phase to angular error* to get the R15 fit back exactly (the fit table only gains a *k* row).\n- With the conversion on, the geometry fit also tries a start from a coarse grid over overhang and offset angle,\n  because *k* is now about 1 and the R15 start can end in an inverted solution (negative *k*, offset angle at its limit).
+
+**Show page 2** adds a second figure with phase, angular error (with the fitted and optimal geometry curves),
+2nd harmonic and the fit table.
 
 ### About the constant phase offset c
 
@@ -1078,7 +1244,8 @@ electronics, mastering) is not established by this analysis.
 ## Reading the results
 
 - **Page 1** shows phase, delay, level and 2nd harmonic against groove radius (or time).
-- **Page 2** shows phase with the fitted curve, the nulls, and the optimal curve, plus 2nd harmonic and the fit table.
+- **Page 2** shows phase with the fitted curve, the nulls, and the optimal curve, the angular error with the same
+  curves in angular units, plus 2nd harmonic and the fit table.
 - **Tracked frequency** shows the frequency found in each frame. It should be a flat line at the tone
   frequency. If it is not, the tone frequency or the record choice is wrong.
 - **Fit table**: *Fitted* is what the recording shows. *Optimal (target)* is the Loefgren A alignment for the
@@ -1087,7 +1254,8 @@ electronics, mastering) is not established by this analysis.
 - **Processing log** lists what was detected: tone start and end, side, speed deviation, fit result.
   Warnings are also shown at the top of the results.
 - **Download time series CSV** contains time, radius, phase, coherence, levels, tracked frequency, delay, the
-  harmonic columns, the fitted phase and the normalised harmonics.
+  harmonic columns, the fitted phase, the angular error (*angular_error_phase_equiv*) with its fitted geometry
+  curve (*angular_error_fit*) and the normalised harmonics.
 
 ## Troubleshooting
 
@@ -1227,7 +1395,19 @@ with st.sidebar:
             PHASE_FIT_LOFGREN_R2_MM = opt_float("Löfgren outer radius R2 (mm)", D["PHASE_FIT_LOFGREN_R2_MM"], "lgr2",
                                                 help="Unchecked = the record band's outer radius.")
 
-        SHOW_PAGE2 = st.checkbox("Show page 2 (phase + H2 + fit table)", value=D["SHOW_PAGE2"])
+        with st.expander("Angular error (phase to angle conversion)", expanded=True):
+            ANG_NORM = st.checkbox("Convert phase to angular error: (phase - c) × (r / r_ref)^p", value=D["ANG_NORM"],
+                                   help="At a constant angular error the phase grows toward the centre (lower groove "
+                                        "speed, shorter wavelength). This plots the angular error on page 2 and makes "
+                                        "the geometry fits use the same response. Untick for R15 behaviour.")
+            ANG_REF_MM = opt_float("Reference radius r_ref (mm)", D["ANG_REF_MM"], "angref",
+                                   help="Unchecked = the record band's outer radius. The angular error is given in "
+                                        "degrees of phase this angular error would produce at r_ref.")
+            ANG_EXPONENT = st.number_input("Exponent p", value=float(D["ANG_EXPONENT"]), step=0.1, format="%.2f",
+                                           help="1 = phase per degree of angular error proportional to 1/r (groove "
+                                                "speed). 0 = no conversion (phase proportional to angle).")
+
+        SHOW_PAGE2 = st.checkbox("Show page 2 (phase + angular error + H2 + fit table)", value=D["SHOW_PAGE2"])
 
 cfg = dict(
     MODE=MODE, FREQ_CENTER=FREQ_CENTER, FREQ_TOL_HZ=FREQ_TOL_HZ,
@@ -1248,6 +1428,7 @@ cfg = dict(
     PHASE_FIT_OFFSET_ANGLE_GUESS_DEG=PHASE_FIT_OFFSET_ANGLE_GUESS_DEG, PHASE_FIT_TRIM_S=PHASE_FIT_TRIM_S,
     PHASE_FIT_SHOW_OPTIMAL=PHASE_FIT_SHOW_OPTIMAL, PHASE_FIT_LOFGREN_R1_MM=PHASE_FIT_LOFGREN_R1_MM,
     PHASE_FIT_LOFGREN_R2_MM=PHASE_FIT_LOFGREN_R2_MM, PHASE_FIT_OFFSET_DEG=PHASE_FIT_OFFSET_DEG,
+    ANG_NORM=ANG_NORM, ANG_REF_MM=ANG_REF_MM, ANG_EXPONENT=ANG_EXPONENT,
 )
 
 up = st.file_uploader("Stereo WAV or FLAC (FLAC is about half the size and uploads faster)",
@@ -1307,7 +1488,7 @@ if res:
         st.dataframe(tdf, width="content")
 
     tabs = st.tabs(["Page 1: phase, delay, level, H2"]
-                   + (["Page 2: phase, H2, fit"] if "page2" in res["pngs"] else [])
+                   + (["Page 2: phase, angular error, H2, fit"] if "page2" in res["pngs"] else [])
                    + (["Tracked frequency"] if "freq" in res["pngs"] else []))
     keys = ["page1"] + (["page2"] if "page2" in res["pngs"] else []) + (["freq"] if "freq" in res["pngs"] else [])
     base = Path(res["name"]).stem

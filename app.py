@@ -80,7 +80,7 @@ DEFAULTS = dict(
     PHASE_FIT_N1_GUESS_MM=66.0, PHASE_FIT_N2_GUESS_MM=121.0,
     PHASE_FIT_PIVOT_SPINDLE_MM=215.35, PHASE_FIT_EFF_LENGTH_MM=233.0, PHASE_FIT_OVERHANG_GUESS_MM=17.8,
     PHASE_FIT_OFFSET_ANGLE_GUESS_DEG=23.6, PHASE_FIT_TRIM_S=10.0,
-    PHASE_FIT_SHOW_ZENITH_CURVE=True, PHASE_FIT_SHOW_OPTIMAL=True, PHASE_FIT_LOFGREN_R1_MM=60.3, PHASE_FIT_LOFGREN_R2_MM=146.05,
+    PHASE_FIT_ALPHA_KNOWN=False, PHASE_FIT_SHOW_ZENITH_CURVE=True, PHASE_FIT_SHOW_OPTIMAL=True, PHASE_FIT_LOFGREN_R1_MM=60.3, PHASE_FIT_LOFGREN_R2_MM=146.05,
     PHASE_FIT_OFFSET_DEG=0.0,
     # Angular error: phase is not proportional to tracking angle error. At a given angular error the phase grows
     # as the groove gets slower and the recorded wavelength shorter, ~ (r_ref/r)^p with p = 1 for a response
@@ -427,6 +427,7 @@ def run_analysis(path, display_name, C, progress=None):
     phase_opt_curve = None
     phase_zen_curve = None     # optimal (theory) curve shifted by the constant zenith angular offset
     ang_zen_curve = None
+    zen_used = None            # (zenith offset, k, fixed?) when the angular-offset model was used
     phase_opt_nulls = None
     phase_fit_table = None
     PHASE_FIT_MODEL = C["PHASE_FIT_MODEL"]
@@ -465,6 +466,11 @@ def run_analysis(path, display_name, C, progress=None):
                 # tilt), which gives a phase that varies as 1/r: phase = W(r) * (k*E(r) + delta). delta is in the
                 # same units as k*E, i.e. degrees of phase at r_ref (zenith error in degrees = delta / k).
                 # Without the conversion (R15) it stays a constant phase offset c.
+                # Known arm offset angle: fix alpha to the offset-angle input and FIT the zenith offset instead
+                # (they are exactly degenerate, so only one of the two can be fitted).
+                _alpha_fixed = bool(C.get("PHASE_FIT_ALPHA_KNOWN")) and _ang_geo
+                if _alpha_fixed:
+                    _c_fixed = None
                 _offname = "Zenith offset" if _ang_geo else "Offset"
                 _offtxt = "zenith offset" if _ang_geo else "offset"
 
@@ -506,6 +512,9 @@ def run_analysis(path, display_name, C, progress=None):
                 else:
                     _oh_lo, _oh_hi = -20.0, 80.0
                     _al_lo, _al_hi = 5.0, 35.0
+                    if _alpha_fixed:
+                        _a0 = float(C["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"])
+                        _al_lo, _al_hi = _a0 - 1e-6, _a0 + 1e-6      # offset angle held at the given value
                     if _c_fixed is None:
                         def _resid(params, r, y):
                             c, k, oh, alpha = params
@@ -607,6 +616,7 @@ def run_analysis(path, display_name, C, progress=None):
                         ang_c_used = float(c_fit)
                         if _ang_geo:
                             ang_fit_curve = k_fit * _E_deg(radius_mm, L_fit, D_fit, alpha_fit) + c_fit   # c_fit = constant angular (zenith) offset
+                            zen_used = (float(c_fit), float(k_fit), _c_fixed is not None)
                         phase_fit_active = True
                         if _fixL:
                             _mname = "geometry, fixed length"
@@ -624,7 +634,7 @@ def run_analysis(path, display_name, C, progress=None):
                                          ("Leff (mm)", f"{L_fit:.2f}")]
                         _klabel = (f"k at r_ref ({_unit} phase per deg)" if _ang_geo else f"k ({_unit} phase per deg)")
                         _geo_rows.append((_klabel, f"{k_fit:.3f}"))
-                        if _c_fixed is None:
+                        if _c_fixed is None and not _alpha_fixed:
                             # Offset angle is exactly degenerate with the free constant c (alpha only enters E(r)
                             # as an additive constant), so nulls are not determined by the curve shape.
                             phase_fit_note = f"Tracking-error fit ({_mname}): {_given_txt}, R²={r2_fit:.2f}"
@@ -649,14 +659,14 @@ def run_analysis(path, display_name, C, progress=None):
                             else:
                                 _null_txt = "no real null radii for this fitted geometry, "
                             phase_fit_note = (f"Tracking-error fit ({_mname}): {_given_txt}, "
-                                              f"offset angle {alpha_fit:.2f} deg, " + _null_txt +
-                                              f"{_offtxt} {c_fit:+.3f} {_unit} (fixed), R²={r2_fit:.2f}")
+                                              f"offset angle {alpha_fit:.2f} deg{' (given)' if _alpha_fixed else ''}, " + _null_txt +
+                                              f"{_offtxt} {c_fit:+.3f} {_unit} ({'fitted' if _alpha_fixed else 'fixed'}), R²={r2_fit:.2f}")
                             say(phase_fit_note)
                             _fitted_null_str = (f"{n1_fit:.1f} & {n2_fit:.1f}" if _disc >= 0 else "none (complex)")
                             phase_fit_table = ([(lbl, fv, None) for lbl, fv in _geo_rows]
-                                               + [("Offset angle (deg)", f"{alpha_fit:.2f}", None),
+                                               + [("Offset angle (deg)", f"{alpha_fit:.2f}" + (" (given)" if _alpha_fixed else ""), None),
                                                   ("Nulls (mm)", _fitted_null_str, None),
-                                                  (f"{_offname} ({_unit})", f"{c_fit:+.3f} (fixed)", None),
+                                                  (f"{_offname} ({_unit})", f"{c_fit:+.3f} ({'fitted' if _alpha_fixed else 'fixed'})", None),
                                                   ("R²", f"{r2_fit:.2f}", None)])
 
                             # Optimal (Loefgren A) comparison curve for the chosen groove range, same k and c.
@@ -739,7 +749,7 @@ def run_analysis(path, display_name, C, progress=None):
             say("Angular-error conversion needs an active record profile (radius axis). Not applied.", "warn")
         else:
             if ang_c_used is not None:
-                _c_ang, _c_src = ang_c_used, ("fixed" if C["PHASE_FIT_OFFSET_DEG"] is not None else "fitted")
+                _c_ang, _c_src = ang_c_used, ("fixed" if (zen_used[2] if zen_used else C["PHASE_FIT_OFFSET_DEG"] is not None) else "fitted")
             else:
                 _c_ang = float(C["PHASE_FIT_OFFSET_DEG"]) if C["PHASE_FIT_OFFSET_DEG"] is not None else 0.0
                 _c_src = "set manually" if C["PHASE_FIT_OFFSET_DEG"] is not None else "assumed 0, no fit"
@@ -831,7 +841,7 @@ def run_analysis(path, display_name, C, progress=None):
         RADIUS_MODE=RADIUS_MODE, prof_label=prof_label, sp_side=sp_side, prof_markers=prof_markers,
         sp_r0=sp_r0, sp_r1=sp_r1, duration_s=duration_s, times=times, x_plot=x_plot,
         phase_smooth=phase_smooth, phase_fit_active=phase_fit_active, phase_fit_curve=phase_fit_curve,
-        phase_fit_nulls=phase_fit_nulls, phase_opt_curve=phase_opt_curve, phase_zen_curve=phase_zen_curve, ang_zen_curve=ang_zen_curve, phase_opt_nulls=phase_opt_nulls,
+        phase_fit_nulls=phase_fit_nulls, phase_opt_curve=phase_opt_curve, phase_zen_curve=phase_zen_curve, zen_used=zen_used, ang_ref_for_note=ang_ref_mm, ang_zen_curve=ang_zen_curve, phase_opt_nulls=phase_opt_nulls,
         phase_fit_table=phase_fit_table, phase_fit_note=phase_fit_note, radius_note=radius_note,
         harm_norm_note=harm_norm_note, harm_norm_active=harm_norm_active, norm_ref_mm=norm_ref_mm,
         harmonic_db_norm_L_smooth=harmonic_db_norm_L_smooth, harmonic_db_norm_R_smooth=harmonic_db_norm_R_smooth,
@@ -899,6 +909,7 @@ def draw_phase(ax, legend_y, R, C):
         t1, t2 = R["phase_opt_nulls"]
         handles.append(ax.plot(x, R["phase_opt_curve"], color='#5ad25a', linewidth=1.3, linestyle=':',
                                label=f"Optimal alignment curve (nulls {t1:.1f}, {t2:.1f} mm)")[0])
+    _zen_note(ax, R)
     if R.get("phase_zen_curve") is not None:
         handles.append(ax.plot(x, R["phase_zen_curve"], color='#e0a030', linewidth=1.3, linestyle='-.',
                                label="Optimal curve + constant zenith angular error")[0])
@@ -908,6 +919,19 @@ def draw_phase(ax, legend_y, R, C):
               ncol=min(len(handles), 2), frameon=True)
     if C["Y_AXIS_LIMITS"]:
         ax.set_ylim(C["Y_AXIS_LIMITS"])
+
+
+def _zen_note(ax, R):
+    """Note in the axes: the constant zenith (angular) offset used by the fit."""
+    z = R.get("zen_used")
+    if not z:
+        return
+    d, k, fixed = z
+    ref = R.get("ang_ref_for_note")
+    txt = (f"Zenith offset used: {d:+.3f} deg of phase at {ref:.0f} mm ({'set manually' if fixed else 'fitted'})"
+           + (f" = {d / k:+.3f} deg of angle" if abs(k) > 1e-9 else ""))
+    ax.text(0.01, 0.97, txt, transform=ax.transAxes, ha="left", va="top", fontsize=9, color="#7fc8ff",
+            bbox=dict(boxstyle="round,pad=0.3", fc="#00000080", ec="#7fc8ff", lw=0.6))
 
 
 def draw_ang(ax, legend_y, R, C):
@@ -931,6 +955,7 @@ def draw_ang(ax, legend_y, R, C):
     if R.get("ang_zen_curve") is not None:
         handles.append(ax.plot(x, R["ang_zen_curve"], color='#e0a030', linewidth=1.3, linestyle='-.',
                                label="Optimal curve + constant zenith angular error")[0])
+    _zen_note(ax, R)
     ax.axhline(0.0, color="#888888", linewidth=0.8)
     unit = "deg" if R["PHASE_UNIT"] == "degrees" else "rad"
     ax.set_ylabel(f"Angular error ({unit}, phase-equiv. at {ref:.0f} mm)")
@@ -1312,6 +1337,15 @@ def show_guide():
     st.markdown(GUIDE_MD)
 
 
+st.markdown("""<style>
+/* make the zenith-offset setting stand out in the sidebar */
+section[data-testid="stSidebar"] .st-key-cfix_on label, section[data-testid="stSidebar"] .st-key-cfix_on label *,
+section[data-testid="stSidebar"] .st-key-cfix label, section[data-testid="stSidebar"] .st-key-cfix label *,
+section[data-testid="stSidebar"] .st-key-alphaknown label, section[data-testid="stSidebar"] .st-key-alphaknown label * {
+    color: #7fc8ff !important; font-weight: 600;
+}
+</style>""", unsafe_allow_html=True)
+
 with st.sidebar:
     if st.button("📖 User guide", width="stretch", key="open_guide"):
         show_guide()
@@ -1406,6 +1440,12 @@ with st.sidebar:
             if PHASE_FIT_MODEL in ("geometry", "geometry_L"):
                 PHASE_FIT_OVERHANG_GUESS_MM = st.number_input("Overhang start guess (mm)", value=D["PHASE_FIT_OVERHANG_GUESS_MM"], format="%.2f")
                 PHASE_FIT_OFFSET_ANGLE_GUESS_DEG = st.number_input("Offset angle start guess (deg)", value=D["PHASE_FIT_OFFSET_ANGLE_GUESS_DEG"], format="%.2f")
+                PHASE_FIT_ALPHA_KNOWN = st.checkbox("Offset angle is known: fix it and fit the zenith offset",
+                                                    value=D["PHASE_FIT_ALPHA_KNOWN"], key="alphaknown",
+                                                    help="Holds the arm offset angle at the value above and fits the constant "
+                                                         "angular (zenith) offset instead. Offset angle and zenith offset are "
+                                                         "degenerate, so only one of them can be fitted. Needs the angular-error "
+                                                         "conversion; the manual zenith offset is then ignored.")
             else:
                 c1, c2 = st.columns(2)
                 PHASE_FIT_N1_GUESS_MM = c1.number_input("Inner null guess (mm), shape", value=D["PHASE_FIT_N1_GUESS_MM"])
@@ -1459,7 +1499,7 @@ cfg = dict(
     PHASE_FIT_PIVOT_SPINDLE_MM=PHASE_FIT_PIVOT_SPINDLE_MM, PHASE_FIT_EFF_LENGTH_MM=PHASE_FIT_EFF_LENGTH_MM,
     PHASE_FIT_OVERHANG_GUESS_MM=PHASE_FIT_OVERHANG_GUESS_MM,
     PHASE_FIT_OFFSET_ANGLE_GUESS_DEG=PHASE_FIT_OFFSET_ANGLE_GUESS_DEG, PHASE_FIT_TRIM_S=PHASE_FIT_TRIM_S,
-    PHASE_FIT_SHOW_ZENITH_CURVE=PHASE_FIT_SHOW_ZENITH_CURVE, PHASE_FIT_SHOW_OPTIMAL=PHASE_FIT_SHOW_OPTIMAL, PHASE_FIT_LOFGREN_R1_MM=PHASE_FIT_LOFGREN_R1_MM,
+    PHASE_FIT_ALPHA_KNOWN=(PHASE_FIT_ALPHA_KNOWN if PHASE_FIT_MODEL in ("geometry", "geometry_L") else False), PHASE_FIT_SHOW_ZENITH_CURVE=PHASE_FIT_SHOW_ZENITH_CURVE, PHASE_FIT_SHOW_OPTIMAL=PHASE_FIT_SHOW_OPTIMAL, PHASE_FIT_LOFGREN_R1_MM=PHASE_FIT_LOFGREN_R1_MM,
     PHASE_FIT_LOFGREN_R2_MM=PHASE_FIT_LOFGREN_R2_MM, PHASE_FIT_OFFSET_DEG=PHASE_FIT_OFFSET_DEG,
     ANG_NORM=ANG_NORM, ANG_REF_MM=ANG_REF_MM, ANG_EXPONENT=ANG_EXPONENT,
 )
